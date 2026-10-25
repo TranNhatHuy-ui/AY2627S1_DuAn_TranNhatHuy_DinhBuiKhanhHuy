@@ -1,0 +1,17 @@
+# compiled Java and build output (the scripts recompile automatically)
+out/
+*.class
+
+# Python
+__pycache__/
+*.pyc
+
+# editors and operating systems
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# archives
+*.zip

@@ -1,0 +1,14 @@
+MAEI ablation benchmark - system information
+==================================================
+date: 2026-10-25 12:34:29
+mode: full   reps: default   timeout: 1800s   heap: 8192 MB
+os: Windows-10-10.0.19045-SP0
+machine: AMD64
+processor: Intel64 Family 6 Model 94 Stepping 3, GenuineIntel
+logical cpus: 4
+python: 3.14.3
+java: java version "25.0.5" 2026-10-20 LTS | Java(TM) SE Runtime Environment (build 25.0.5+9-LTS-148) | Java HotSpot(TM) 64-Bit Server VM (build 25.0.5+9-LTS-148, mixed mode, sharing)
+cpu name: Intel(R) Core(TM) i5-6400 CPU @ 2.70GHz
+ram (MB): 16348
+
+Tips used for stable timing: plugged in, other programs closed, nothing else running in parallel.

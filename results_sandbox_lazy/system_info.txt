@@ -1,0 +1,13 @@
+MAEI ablation benchmark - system information
+==================================================
+date: 2026-10-25 04:57:42
+mode: full   reps: 3   timeout: 300s   heap: 4096 MB
+os: Linux-6.18.44-fc-v153-x86_64-with-glibc2.39
+machine: x86_64
+processor: x86_64
+logical cpus: 1
+python: 3.12.3
+java: openjdk version "21.0.10" 2026-01-20 | OpenJDK Runtime Environment (build 21.0.10+7-Ubuntu-124.04) | OpenJDK 64-Bit Server VM (build 21.0.10+7-Ubuntu-124.04, mixed mode, sharing)
+ram (MB): 3995
+
+Tips used for stable timing: plugged in, other programs closed, nothing else running in parallel.

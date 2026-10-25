@@ -1,0 +1,401 @@
+--- /home/claude/src_orig/AlgoHAEI.java	2026-10-25 04:54:21.729048065 +0000
++++ src/AlgoHAEI.java	2026-10-25 04:54:26.710920346 +0000
+@@ -49,6 +49,21 @@
+     public boolean useMAEP = true;
+     /** Pruning Strategy 3 (EAECP). When false, EAECS is neither built nor queried. */
+     public boolean useEAECP = true;
++    /**
++     * ABLATION ADDITION (lazy EAECS). Only used when {@link #useEAECP} is true. false = the authors' way: the whole co-occurrence
++     * structure is built during the second database scan. true = nothing is built in the scan; the value EAECS(x,y) is computed
++     * the first time the search asks for the pair (x,y), by merging the AE-Lists of the single items x and y, and then cached.
++     * Both ways give exactly the same values, so the same pairs are skipped and the same joins are made.
++     */
++    public boolean lazyEAECS = false;
++    /** Time (nanoseconds) spent on EAECS: building it in the second scan (eager) or computing pairs on demand (lazy). 0 without EAECP. */
++    long eaecsNanos = 0;
++    /** Number of pair values computed on demand (lazy EAECS only). */
++    long eaecsLazyPairs = 0;
++    /** Lazy EAECS: the AE-List of every single item (kept after the second scan). */
++    Map<Integer,UtilityList> singletonULs;
++    /** Lazy EAECS: for every transaction, the maximum utility among the items that survived Pruning Strategy 1 (what the eager scan uses as mu). */
++    double[] prunedMu;
+     /** Search order: false = depth-first (the paper's), true = breadth-first. */
+     public boolean useBFS = false;
+     /** Item ordering used for AE-List construction and for the search tree (default: the paper's AEUB_ASC). */
+@@ -219,6 +234,7 @@
+         try {
+             myInput = new BufferedReader(new InputStreamReader(new FileInputStream(new File(input1))));
+             int tid = 0;
++            if (useEAECP && lazyEAECS) prunedMu = new double[tidMu.length];
+             while ((thisLine = myInput.readLine()) != null) {
+                 if (thisLine.isEmpty() == true || thisLine.charAt(0) == '#') {
+                     continue;
+@@ -272,25 +288,33 @@
+                     UtilityList utilityListOfItem = mapItemToUtility.get(pair.item);
+                     Element element = new Element(tid, pair.utility, rmu, rmi,mn);
+                     utilityListOfItem.addElement(element,mn);
+-                    if (useEAECP) {
+-                    Map<Integer,Double> mapEAESItem = mapItemToEAES.get(pair.item);
+-
+-                    // EAECS
+-                    if(mapEAESItem == null){
+-                        mapEAESItem = new HashMap<Integer,Double>();
+-                        mapItemToEAES.put(pair.item,mapEAESItem);
+-                    }
+-                    for(int j = i+1;j < revisedTransaction.size();j++){
+-                        Pair pairAfter = revisedTransaction.get(j);
+-                        Double invOfItem =(double)(mapItemToINV.get(pair.item) + mapItemToINV.get(pairAfter.item));
+-                        Double aeubSum = mapEAESItem.get(pairAfter.item);
+-                        if(aeubSum == null) {
+-                            mapEAESItem.put(pairAfter.item, maxUtilityOfCurrentTranscation / invOfItem);
+-                        }else {
+-                            mapEAESItem.put(pairAfter.item,aeubSum + maxUtilityOfCurrentTranscation / invOfItem);
++                }
++                // EAECS (eager, the authors' way): for every pair of items of the revised transaction add mu(T) / (inv(x) + inv(y)).
++                // Kept in a loop of its own (the values are the same as inside the AE-List loop) so that its time can be measured
++                // with two clock readings per transaction instead of two per item.
++                if (useEAECP && lazyEAECS) {
++                    prunedMu[tid] = maxUtilityOfCurrentTranscation;
++                } else if (useEAECP) {
++                    long eaecsStart = System.nanoTime();
++                    for(int i = 0;i < revisedTransaction.size(); i++){
++                        Pair pair = revisedTransaction.get(i);
++                        Map<Integer,Double> mapEAESItem = mapItemToEAES.get(pair.item);
++                        if(mapEAESItem == null){
++                            mapEAESItem = new HashMap<Integer,Double>();
++                            mapItemToEAES.put(pair.item,mapEAESItem);
++                        }
++                        for(int j = i+1;j < revisedTransaction.size();j++){
++                            Pair pairAfter = revisedTransaction.get(j);
++                            Double invOfItem =(double)(mapItemToINV.get(pair.item) + mapItemToINV.get(pairAfter.item));
++                            Double aeubSum = mapEAESItem.get(pairAfter.item);
++                            if(aeubSum == null) {
++                                mapEAESItem.put(pairAfter.item, maxUtilityOfCurrentTranscation / invOfItem);
++                            }else {
++                                mapEAESItem.put(pairAfter.item,aeubSum + maxUtilityOfCurrentTranscation / invOfItem);
++                            }
+                         }
+                     }
+-                    } // end if (useEAECP)
++                    eaecsNanos += System.nanoTime() - eaecsStart;
+                 }
+                 tid++;
+             }
+@@ -302,6 +326,7 @@
+             }
+         }
+ 
++        singletonULs = mapItemToUtility;
+         // Step 9: collect the AE-Lists and sort them in the item order
+         listOfUtilityLists.addAll(mapItemToUtility.values());
+ 
+@@ -326,6 +351,106 @@
+ 
+ 
+     /**
++     * Pruning Strategy 3 (EAECP): may the join of X (last item x) and Y (last item y) still lead to a HAEI? With EAECS built in the scan
++     * (the authors' way) this is a table look-up; with {@link #lazyEAECS} the pair value is computed the first time it is asked for.
++     * Without EAECP, or for an item that has no row in EAECS, every pair is allowed.
++     *
++     * @param x last item of X
++     * @param y last item of Y (later than x in the item order)
++     * @return false if EAECS(x,y) is missing or below minae, so the join can be skipped
++     */
++    private boolean eaecsAllows(int x, int y) {
++        if (lazyEAECS && useEAECP) return lazyAllows(x, y);
++        Map<Integer,Double> mapEAES = mapItemToEAES.get(x);
++        if (mapEAES != null) {
++            Double aeubY = mapEAES.get(y);
++            if (aeubY == null || aeubY < min_AE) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /**
++     * Lazy EAECS look-up: returns the cached value of EAECS(x,y), computing it first if the pair has not been asked for before.
++     * The eager structure has a row for every item that occurs in the data, and a missing entry means "x and y never occur together";
++     * the same two rules are applied here, so the answers are identical to the eager ones.
++     *
++     * @param x last item of X
++     * @param y last item of Y
++     * @return false if the pair is rejected by EAECP
++     */
++    private boolean lazyAllows(int x, int y) {
++        UtilityList lx = singletonULs.get(x);
++        UtilityList ly = singletonULs.get(y);
++        if (lx == null || ly == null || lx.elements.isEmpty()) return true;
++        Map<Integer,Double> row = mapItemToEAES.get(x);
++        if (row == null) {
++            row = new HashMap<Integer,Double>();
++            mapItemToEAES.put(x, row);
++        }
++        Double v = row.get(y);
++        if (v == null) {
++            long t0 = System.nanoTime();
++            v = lazyPairValue(x, y, lx, ly);
++            row.put(y, v);
++            eaecsNanos += System.nanoTime() - t0;
++            eaecsLazyPairs++;
++        }
++        return !(v.isNaN() || v < min_AE);
++    }
++
++    /**
++     * Computes EAECS(x,y) = sum over the transactions that contain both x and y of mu(T) / (inv(x) + inv(y)), where mu(T) is the
++     * maximum utility of the items of T that survived Pruning Strategy 1. The common transactions are found by walking the two
++     * AE-Lists of the single items in tid order (or, if one list is much shorter, by binary search in the longer one), and the terms are
++     * added in tid order, exactly as the eager scan adds them, so the result is bit-for-bit the same.
++     *
++     * @param x  the earlier item
++     * @param y  the later item
++     * @param lx AE-List of x
++     * @param ly AE-List of y
++     * @return the value, or NaN if x and y never occur together
++     */
++    private double lazyPairValue(int x, int y, UtilityList lx, UtilityList ly) {
++        double invSum = (double)(mapItemToINV.get(x) + mapItemToINV.get(y));
++        List<Element> a = lx.elements, b = ly.elements;
++        double sum = 0;
++        boolean any = false;
++        if (a.size() * 8L < b.size() || b.size() * 8L < a.size()) {
++            List<Element> small = a.size() <= b.size() ? a : b;
++            List<Element> large = small == a ? b : a;
++            for (int i = 0; i < small.size(); i++) {
++                int tid = small.get(i).tid;
++                boolean found = false;
++                int lo = 0, hi = large.size() - 1;
++                while (lo <= hi) {
++                    int mid = (lo + hi) >>> 1;
++                    int t = large.get(mid).tid;
++                    if (t < tid) lo = mid + 1; else if (t > tid) hi = mid - 1; else { found = true; break; }
++                }
++                if (found) {
++                    double term = prunedMu[tid] / invSum;
++                    sum = any ? sum + term : term;
++                    any = true;
++                }
++            }
++        } else {
++            int i = 0, j = 0;
++            while (i < a.size() && j < b.size()) {
++                int ta = a.get(i).tid, tb = b.get(j).tid;
++                if (ta == tb) {
++                    double term = prunedMu[ta] / invSum;
++                    sum = any ? sum + term : term;
++                    any = true;
++                    i++; j++;
++                } else if (ta < tb) i++; else j++;
++            }
++        }
++        return any ? sum : Double.NaN;
++    }
++
++    /**
+      * Depth-first mining (Algorithm 2 of the paper). For every itemset X in {@code ULs}: output it if it is a HAEI,
+      * compute its pruning bound, and if the bound reaches minae join X with each later itemset Y (after the EAECS
+      * check) and recurse on the extensions.
+@@ -362,12 +487,8 @@
+                     UtilityList Y = ULs.get(j);
+                     // Step 3: Pruning Strategy 3 - skip the pair (X, Y) if EAECS says it cannot reach minae
+                     //EAES-Prune
+-                    Map<Integer,Double> mapEAES = mapItemToEAES.get(X.item);
+-                    if(mapEAES != null) {
+-                        Double aeubY = mapEAES.get(Y.item);
+-                        if (aeubY == null || aeubY < min_AE) {
+-                            continue;
+-                        }
++                    if (!eaecsAllows(X.item, Y.item)) {
++                        continue;
+                     }
+                     exULs.add(construct(pUL,X,Y));
+                 }
+@@ -415,12 +536,8 @@
+                     List<UtilityList> exULs = new ArrayList<UtilityList>();
+                     for (int j = i + 1; j < ULs.size(); j++) {
+                         UtilityList Y = ULs.get(j);
+-                        Map<Integer,Double> mapEAES = mapItemToEAES.get(X.item);
+-                        if (mapEAES != null) {
+-                            Double aeubY = mapEAES.get(Y.item);
+-                            if (aeubY == null || aeubY < min_AE) {
+-                                continue;
+-                            }
++                        if (!eaecsAllows(X.item, Y.item)) {
++                            continue;
+                         }
+                         exULs.add(construct(pUL, X, Y));
+                     }
+--- /home/claude/src_orig/RunOne.java	2026-10-25 04:54:21.728924452 +0000
++++ src/RunOne.java	2026-10-25 04:54:43.485648979 +0000
+@@ -5,7 +5,7 @@
+  * Client class: runs ONE configuration of ONE algorithm in a fresh JVM and prints a single JSON line.
+  *
+  * Usage: java RunOne -algo MAEI|HAEIMiner -data <DBUtility> -stock <stock> -minae <value>
+- *                    [-maep on|off] [-eaecp on|off] [-order AEUB_ASC|AEUB_DESC|INVESTMENT_ASC|RANDOM]
++ *                    [-maep on|off] [-eaecp on|off] [-lazy on|off (lazy EAECS)] [-order AEUB_ASC|AEUB_DESC|INVESTMENT_ASC|RANDOM]
+  *                    [-traversal DFS|BFS] [-disk on|off (HAEIMiner only)] [-frac 0.2..1.0] [-out <file>]
+  *
+  * Reported fields:
+@@ -23,6 +23,7 @@
+  *                     mean and maximum number of items of the itemsets found
+  *   itemset_hash      order-independent 64-bit fingerprint of the SET of itemsets found; two runs found exactly the
+  *                     same itemsets if and only if (up to hash collisions) their fingerprints are equal
++ *   eaecs_ms          time spent on EAECS: building it in the second scan (eager) or computing pairs on demand (-lazy on); 0 without EAECP and for HAEIMiner
+  * These values are read back from the output file AFTER the timed run and the heap sampler have finished, so they
+  * do not influence the measured runtime or memory.
+  */
+@@ -74,6 +75,7 @@
+ 
+         // Step 3: run the selected algorithm (a server class) with the selected switches
+         long runtime, joins, haei, cand = 0;
++        double eaecsMs = 0;
+         if (algo.equalsIgnoreCase("HAEIMiner")) {
+             AlgoHAEIMiner m = new AlgoHAEIMiner();
+             m.maxTransactions = maxTx;
+@@ -86,11 +88,13 @@
+             m.maxTransactions = maxTx;
+             m.useMAEP = !a.getOrDefault("-maep", "on").equalsIgnoreCase("off");
+             m.useEAECP = !a.getOrDefault("-eaecp", "on").equalsIgnoreCase("off");
++            m.lazyEAECS = a.getOrDefault("-lazy", "off").equalsIgnoreCase("on");
+             m.useBFS = a.getOrDefault("-traversal", "DFS").equalsIgnoreCase("BFS");
+             m.orderStrategy = AlgoHAEI.OrderStrategy.valueOf(a.getOrDefault("-order", "AEUB_ASC").toUpperCase());
+             m.runAlgorithm(data, stock, out.getPath(), minae);
+             runtime = m.endTimestamp - m.startTimestamp;
+             joins = m.joinCount; haei = m.haeiCount;
++            eaecsMs = m.eaecsNanos / 1e6;
+         }
+         // Step 4: stop the sampler and print the result as one JSON line
+         sampler.interrupt();
+@@ -99,10 +103,10 @@
+         System.out.println(String.format(Locale.ROOT,
+             "{\"runtime_ms\": %d, \"peak_heap_mb\": %.2f, \"baseline_heap_mb\": %.2f, \"join_count\": %d, \"haei_count\": %d, \"candidates\": %d, "
+             + "\"ae_min\": %.17g, \"ae_max\": %.17g, \"ae_mean\": %.17g, \"ae_sum\": %.17g, \"eff_max\": %.17g, \"eff_mean\": %.17g, "
+-            + "\"size_mean\": %.4f, \"size_max\": %d, \"itemset_hash\": %d}",
++            + "\"size_mean\": %.4f, \"size_max\": %d, \"itemset_hash\": %d, \"eaecs_ms\": %.2f}",
+             runtime, peak[0] / 1048576.0, baseline / 1048576.0, joins, haei, cand,
+             st.count == 0 ? 0 : st.aeMin, st.aeMax, st.aeSum / n, st.aeSum, st.effMax, st.effSum / n,
+-            st.sizeSum / n, st.sizeMax, st.hash));
++            st.sizeSum / n, st.sizeMax, st.hash, eaecsMs));
+     }
+ 
+     /** Summary of the efficiency values and itemsets found in one output file. */
+--- /home/claude/src_orig/ExperimentBase.java	2026-10-25 04:54:21.729021800 +0000
++++ src/ExperimentBase.java	2026-10-25 04:54:43.488435472 +0000
+@@ -21,7 +21,7 @@
+ 
+ /**
+  * Client base class shared by all experiment clients ({@link ExpPruning}, {@link ExpOrder}, {@link ExpTraversal},
+- * {@link ExpScalability}). An experiment client decides WHICH configurations to run (its axis of the ablation study);
++ * {@link ExpScalability}, {@link ExpLazy}). An experiment client decides WHICH configurations to run (its axis of the ablation study);
+  * this class does the common work: it parses the command line, runs every configuration in a FRESH JVM through the
+  * {@link RunOne} client (so timings and memory never contaminate each other), enforces a time limit, and appends one
+  * CSV row per run to {@code results/results.csv}. Runs already present in the CSV are skipped, so an interrupted
+@@ -86,7 +86,7 @@
+ 
+     /** One configuration (one row of the results table before repetition). */
+     protected static final class Config {
+-        /** Experiment axis: pruning, order, traversal or scalability. */
++        /** Experiment axis: pruning, order, traversal, scalability or lazy. */
+         final String axis;
+         /** Dataset name. */
+         final String dataset;
+@@ -126,12 +126,16 @@
+     protected static final String[] ORDERS = {"AEUB_ASC", "AEUB_DESC", "INVESTMENT_ASC", "RANDOM"};
+     /** Fractions of the transactions used by the scalability experiment. */
+     protected static final double[] SCAL_FRACTIONS = {0.2, 0.4, 0.6, 0.8, 1.0};
++    /** Variants of the pruning experiment (the lazy-EAECS variant has its own experiment, {@link ExpLazy}). */
++    protected static final String[] PRUNING_VARIANTS = {"FULL", "NO_EAECP", "NO_MAEP", "NEITHER", "HAEIMiner_mem", "HAEIMiner_disk"};
++    /** Variants of the lazy-EAECS experiment: EAECS built in the scan, built on demand, and not used at all. */
++    protected static final String[] LAZY_VARIANTS = {"FULL", "FULL_LAZY", "NO_EAECP"};
+     /** Variants compared in the scalability experiment. */
+     protected static final String[] SCAL_VARIANTS = {"FULL", "NEITHER", "HAEIMiner_mem", "HAEIMiner_disk"};
+     /** Column names of the results CSV. */
+     protected static final String[] CSV_FIELDS = {"axis", "dataset", "minae", "variant", "order", "traversal", "frac",
+         "rep", "status", "runtime_ms", "peak_heap_mb", "baseline_heap_mb", "join_count", "haei_count", "candidates",
+-        "ae_min", "ae_max", "ae_mean", "ae_sum", "eff_max", "eff_mean", "size_mean", "size_max", "itemset_hash"};
++        "ae_min", "ae_max", "ae_mean", "ae_sum", "eff_max", "eff_mean", "size_mean", "size_max", "itemset_hash", "eaecs_ms"};
+ 
+     static {
+         DATASETS.put("chess", new Dataset("chess", "data/chess_DBUtility.txt", "data/chess_stock.txt",
+@@ -146,6 +150,7 @@
+         VARIANTS.put("NO_EAECP", new String[]{"-algo", "MAEI", "-maep", "on", "-eaecp", "off"});
+         VARIANTS.put("NO_MAEP", new String[]{"-algo", "MAEI", "-maep", "off", "-eaecp", "on"});
+         VARIANTS.put("NEITHER", new String[]{"-algo", "MAEI", "-maep", "off", "-eaecp", "off"});
++        VARIANTS.put("FULL_LAZY", new String[]{"-algo", "MAEI", "-maep", "on", "-eaecp", "on", "-lazy", "on"});
+         VARIANTS.put("HAEIMiner_mem", new String[]{"-algo", "HAEIMiner", "-disk", "off"});
+         VARIANTS.put("HAEIMiner_disk", new String[]{"-algo", "HAEIMiner", "-disk", "on"});
+     }
+@@ -324,7 +329,7 @@
+         row[0] = c.axis; row[1] = c.dataset; row[2] = fmt(c.minae); row[3] = c.variant; row[4] = c.order;
+         row[5] = c.traversal; row[6] = Double.toString(c.frac); row[7] = Integer.toString(rep); row[8] = status;
+         String[] keys = {"runtime_ms", "peak_heap_mb", "baseline_heap_mb", "join_count", "haei_count", "candidates",
+-            "ae_min", "ae_max", "ae_mean", "ae_sum", "eff_max", "eff_mean", "size_mean", "size_max", "itemset_hash"};
++            "ae_min", "ae_max", "ae_mean", "ae_sum", "eff_max", "eff_mean", "size_mean", "size_max", "itemset_hash", "eaecs_ms"};
+         for (int i = 0; i < keys.length; i++) row[9 + i] = status.equals("ok") ? jsonValue(json, keys[i]) : "";
+         return row;
+     }
+--- /home/claude/src_orig/ExpPruning.java	2026-10-25 04:54:21.728948220 +0000
++++ src/ExpPruning.java	2026-10-25 04:54:43.488047418 +0000
+@@ -39,7 +39,7 @@
+     protected List<Config> buildConfigs(Dataset d, double mid) {
+         List<Config> out = new ArrayList<Config>();
+         for (double minae : d.thresholds(mode)) {
+-            for (String variant : VARIANTS.keySet()) {
++            for (String variant : PRUNING_VARIANTS) {
+                 out.add(new Config("pruning", d.name, minae, variant, "AEUB_ASC", "DFS", 1.0));
+             }
+         }
+--- /dev/null	2026-10-23 03:16:07.706950182 +0000
++++ src/ExpLazy.java	2026-10-25 04:54:43.488683074 +0000
+@@ -0,0 +1,50 @@
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * Client class of the lazy-EAECS experiment. EAECS (the co-occurrence structure of Pruning Strategy 3) is normally built for every pair
++ * of items during the second database scan. Here the same algorithm is run three ways at every threshold: {@code FULL} (EAECS built in
++ * the scan, the authors' way), {@code FULL_LAZY} (EAECS(x,y) computed only when the search first asks for the pair, then cached) and
++ * {@code NO_EAECP} (no EAECS at all). All three must find the same itemsets; {@code FULL} and {@code FULL_LAZY} must also make exactly
++ * the same number of joins, because both give the same EAECS values. What differs is the time and memory spent on the structure; the
++ * column {@code eaecs_ms} of the results isolates that time. Server class: {@link AlgoHAEI}.
++ */
++public class ExpLazy extends ExperimentBase {
++    /**
++     * Entry point.
++     *
++     * @param args see {@link ExperimentBase}
++     * @throws Exception if the experiment fails
++     */
++    public static void main(String[] args) throws Exception {
++        new ExpLazy().execute(args);
++    }
++
++    /**
++     * Names the axis of this experiment in the results CSV.
++     *
++     * @return "lazy"
++     */
++    @Override
++    protected String axisName() {
++        return "lazy";
++    }
++
++    /**
++     * Builds the configurations for one dataset: every threshold of the dataset crossed with FULL, FULL_LAZY and NO_EAECP.
++     *
++     * @param d   the dataset
++     * @param mid the middle threshold of the dataset (not used; all thresholds are run)
++     * @return the configurations to run
++     */
++    @Override
++    protected List<Config> buildConfigs(Dataset d, double mid) {
++        List<Config> out = new ArrayList<Config>();
++        for (double minae : d.thresholds(mode)) {
++            for (String variant : LAZY_VARIANTS) {
++                out.add(new Config("lazy", d.name, minae, variant, "AEUB_ASC", "DFS", 1.0));
++            }
++        }
++        return out;
++    }
++}

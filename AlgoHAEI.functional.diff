@@ -1,0 +1,192 @@
+--- original/AlgoHAEI.java (comments removed)
++++ src/AlgoHAEI.java (comments removed)
+@@ -7,6 +7,16 @@
+     int haeiCount = 0;
+     int joinCount = 0;
+     double min_AE = 0.0;
++    public enum OrderStrategy { AEUB_ASC, AEUB_DESC, INVESTMENT_ASC, RANDOM }
++    public boolean useMAEP = true;
++    public boolean useEAECP = true;
++    public boolean useBFS = false;
++    public OrderStrategy orderStrategy = OrderStrategy.AEUB_ASC;
++    public int maxTransactions = Integer.MAX_VALUE;
++    long randomSeed = 42L;
++    Map<Integer,Double> mapItemToOrderKey;
++    List<Integer> tidMuList = new ArrayList<Integer>();
++    int[] tidMu;
+     List<UtilityList> listOfUtilityLists = new ArrayList<UtilityList>();
+     Map<Integer,Long> mapItemToINV;
+     Map<Integer,Double> mapItemToAEUB;
+@@ -56,6 +66,7 @@
+                 if (thisLine.isEmpty() == true || thisLine.charAt(0) == '#') {
+                     continue;
+                 }
++                if (tidMuList.size() >= maxTransactions) break;
+                 String[] split = thisLine.split(":");
+                 String[] items = split[0].split(" ");
+                 String[] utilityValues = split[2].split(" ");
+@@ -65,6 +76,7 @@
+                         transactionMUtility = Integer.parseInt(utilityValues[i]);
+                     }
+                 }
++                tidMuList.add(transactionMUtility);
+                 for(int i = 0; i < items.length; i++){
+                     Integer item = Integer.parseInt(items[i]);
+                     Long mu = mapItemToMu.get(item);
+@@ -91,10 +103,13 @@
+                 ItemLists.add(item);
+             }
+         }
++        tidMu = new int[tidMuList.size()];
++        for (int i = 0; i < tidMu.length; i++) tidMu[i] = tidMuList.get(i);
++        buildOrderKeys(ItemLists);
+         Collections.sort(ItemLists, new Comparator<Integer>() {
+             @Override
+             public int compare(Integer o1, Integer o2) {
+-                return mapItemToAEUB.get(o1).compareTo(mapItemToAEUB.get(o2));
++                return compareByOrder(o1, o2);
+             }
+         });
+         Map<Integer,UtilityList> mapItemToUtility = new HashMap<Integer,UtilityList>();
+@@ -110,6 +125,7 @@
+                 if (thisLine.isEmpty() == true || thisLine.charAt(0) == '#') {
+                     continue;
+                 }
++                if (tid >= maxTransactions) break;
+                 String[] split = thisLine.split(":");
+                 String[] items = split[0].split(" ");
+                 String[] utilityValues = split[2].split(" ");
+@@ -130,7 +146,7 @@
+                 Collections.sort(revisedTransaction, new Comparator<Pair>() {
+                     @Override
+                     public int compare(Pair o1, Pair o2) {
+-                        return mapItemToAEUB.get(o1.item).compareTo(mapItemToAEUB.get(o2.item));
++                        return compareByOrder(o1.item, o2.item);
+                     }
+                 });
+                 for(int i = 0;i < revisedTransaction.size(); i++){
+@@ -150,6 +166,7 @@
+                     UtilityList utilityListOfItem = mapItemToUtility.get(pair.item);
+                     Element element = new Element(tid, pair.utility, rmu, rmi,mn);
+                     utilityListOfItem.addElement(element,mn);
++                    if (useEAECP) {
+                     Map<Integer,Double> mapEAESItem = mapItemToEAES.get(pair.item);
+                     if(mapEAESItem == null){
+                         mapEAESItem = new HashMap<Integer,Double>();
+@@ -165,6 +182,7 @@
+                             mapEAESItem.put(pairAfter.item,aeubSum + maxUtilityOfCurrentTranscation / invOfItem);
+                         }
+                     }
++                    }
+                 }
+                 tid++;
+             }
+@@ -179,11 +197,15 @@
+         Collections.sort(listOfUtilityLists, new Comparator<UtilityList>() {
+             @Override
+             public int compare(UtilityList o1, UtilityList o2) {
+-                return mapItemToAEUB.get(o1.item).compareTo(mapItemToAEUB.get(o2.item));
++                return compareByOrder(o1.item, o2.item);
+             }
+         });
+         checkMemory();
+-        HAEIMine(new int[0],null,listOfUtilityLists, min_AE);
++        if (useBFS) {
++            HAEIMineBFS(listOfUtilityLists, min_AE);
++        } else {
++            HAEIMine(new int[0],null,listOfUtilityLists, min_AE);
++        }
+         checkMemory();
+         writer.close();
+         endTimestamp = System.currentTimeMillis();
+@@ -199,7 +221,7 @@
+             if(X.mn == 0) {
+                 Mae = 0;
+             } else{
+-                Mae = calMae(X, length);
++                Mae = useMAEP ? calMae(X, length) : calAeub(X);
+             }
+             if (Mae >= min_AE){
+                 List<UtilityList> exULs = new ArrayList<UtilityList>();
+@@ -221,6 +243,81 @@
+             }
+         }
+     }
++    private void HAEIMineBFS(List<UtilityList> rootULs, double min_AE) throws IOException {
++        Deque<Object[]> queue = new ArrayDeque<Object[]>();
++        queue.add(new Object[]{new int[0], null, rootULs});
++        while (!queue.isEmpty()) {
++            Object[] task = queue.poll();
++            int[] prefix = (int[]) task[0];
++            UtilityList pUL = (UtilityList) task[1];
++            @SuppressWarnings("unchecked")
++            List<UtilityList> ULs = (List<UtilityList>) task[2];
++            for (int i = 0; i < ULs.size(); i++) {
++                UtilityList X = ULs.get(i);
++                int length = prefix.length + 1;
++                if (X.Sumae / length >= min_AE) {
++                    writeOut(prefix, X.item, X.Sumae / length);
++                }
++                double Mae;
++                if (X.mn == 0) {
++                    Mae = 0;
++                } else {
++                    Mae = useMAEP ? calMae(X, length) : calAeub(X);
++                }
++                if (Mae >= min_AE) {
++                    List<UtilityList> exULs = new ArrayList<UtilityList>();
++                    for (int j = i + 1; j < ULs.size(); j++) {
++                        UtilityList Y = ULs.get(j);
++                        Map<Integer,Double> mapEAES = mapItemToEAES.get(X.item);
++                        if (mapEAES != null) {
++                            Double aeubY = mapEAES.get(Y.item);
++                            if (aeubY == null || aeubY < min_AE) {
++                                continue;
++                            }
++                        }
++                        exULs.add(construct(pUL, X, Y));
++                    }
++                    if (!exULs.isEmpty()) {
++                        int[] newPrefix = new int[prefix.length + 1];
++                        System.arraycopy(prefix, 0, newPrefix, 0, prefix.length);
++                        newPrefix[prefix.length] = X.item;
++                        queue.add(new Object[]{newPrefix, X, exULs});
++                    }
++                }
++            }
++        }
++    }
++    private double calAeub(UtilityList ul){
++        double sum = 0;
++        for (int i = 0; i < ul.elements.size(); i++) {
++            sum += tidMu[ul.elements.get(i).tid];
++        }
++        return sum / ul.inv;
++    }
++    private int compareByOrder(Integer a, Integer b) {
++        int c = mapItemToOrderKey.get(a).compareTo(mapItemToOrderKey.get(b));
++        return c != 0 ? c : Integer.compare(a, b);
++    }
++    private void buildOrderKeys(List<Integer> items) {
++        mapItemToOrderKey = new HashMap<Integer,Double>();
++        switch (orderStrategy) {
++            case AEUB_ASC:
++                for (Integer it : items) mapItemToOrderKey.put(it, mapItemToAEUB.get(it));
++                break;
++            case AEUB_DESC:
++                for (Integer it : items) mapItemToOrderKey.put(it, -mapItemToAEUB.get(it));
++                break;
++            case INVESTMENT_ASC:
++                for (Integer it : items) mapItemToOrderKey.put(it, (double) mapItemToINV.get(it));
++                break;
++            case RANDOM:
++                List<Integer> shuffled = new ArrayList<Integer>(items);
++                Collections.sort(shuffled);
++                Collections.shuffle(shuffled, new Random(randomSeed));
++                for (int r = 0; r < shuffled.size(); r++) mapItemToOrderKey.put(shuffled.get(r), (double) r);
++                break;
++        }
++    }
+     private double calMae(UtilityList ul, int length){
+         double sumMau = 0;
+         for(int i = 0;i<ul.elements.size();i++){
